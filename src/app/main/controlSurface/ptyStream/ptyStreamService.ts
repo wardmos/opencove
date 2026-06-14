@@ -16,7 +16,10 @@ type PtyStreamClientState = {
   clientId: string
   kind: PtyStreamClientKind | null
   didHandshake: boolean
+  isAlive: boolean
 }
+
+const PTY_STREAM_HEARTBEAT_INTERVAL_MS = 30_000
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -183,6 +186,14 @@ export function createPtyStreamService(options: {
     }
 
     clients.add(ws)
+
+    state.isAlive = true
+    ws.on('pong', () => {
+      const current = stateBySocket.get(ws)
+      if (current) {
+        current.isAlive = true
+      }
+    })
 
     ws.once('close', () => {
       clients.delete(ws)
@@ -357,6 +368,37 @@ export function createPtyStreamService(options: {
     })
   })
 
+  // The WebSocket server has no built-in liveness tracking (clientTracking is off), so a peer that
+  // dies without a clean TCP close (desktop force-quit, laptop sleep, SSH tunnel drop) would linger
+  // as a ghost subscriber/controller until the OS eventually tears the socket down. That stale
+  // controller demotes every reconnecting client to viewer and blocks resize, leaving restored
+  // terminals stuck. Ping each socket every interval and terminate the ones that missed the prior
+  // pong; terminate() fires 'close', which unregisters the client and releases its sessions.
+  const heartbeatTimer = setInterval(() => {
+    clients.forEach(ws => {
+      const clientState = stateBySocket.get(ws)
+      if (clientState && !clientState.isAlive) {
+        try {
+          ws.terminate()
+        } catch {
+          // ignore
+        }
+        return
+      }
+
+      if (clientState) {
+        clientState.isAlive = false
+      }
+
+      try {
+        ws.ping()
+      } catch {
+        // ignore
+      }
+    })
+  }, PTY_STREAM_HEARTBEAT_INTERVAL_MS)
+  heartbeatTimer.unref()
+
   const handleUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
     if (!req.url) {
       socket.destroy()
@@ -404,6 +446,7 @@ export function createPtyStreamService(options: {
         clientId: randomBytes(12).toString('base64url'),
         kind: null,
         didHandshake: false,
+        isAlive: true,
       })
 
       wss.emit('connection', ws, req)
@@ -414,6 +457,8 @@ export function createPtyStreamService(options: {
     hub,
     handleUpgrade,
     dispose: () => {
+      clearInterval(heartbeatTimer)
+
       clients.forEach(client => {
         try {
           client.close()

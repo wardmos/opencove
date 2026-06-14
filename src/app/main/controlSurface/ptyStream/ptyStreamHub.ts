@@ -75,6 +75,16 @@ export class PtyStreamHub {
     })
   }
 
+  private hasLiveController(session: SessionState): boolean {
+    const controllerClientId = session.controllerClientId
+    if (!controllerClientId) {
+      return false
+    }
+
+    const controller = this.clients.get(controllerClientId)
+    return controller !== undefined && controller.ws.readyState === controller.ws.OPEN
+  }
+
   public registerClient(options: {
     clientId: string
     kind: PtyStreamClientKind
@@ -308,6 +318,14 @@ export class PtyStreamHub {
     }
 
     this.flushSession(session)
+
+    // Release a controller that no longer maps to a live, open socket. After a client quits, its
+    // 'close' may not have been processed yet (it can lag until the heartbeat reaps a half-open
+    // socket). Without this, the stale controllerClientId would demote every reconnecting client to
+    // viewer, blocking resize and leaving restored terminals stuck until a keystroke self-promotes.
+    if (session.controllerClientId && !this.hasLiveController(session)) {
+      this.setSessionController(session, null)
+    }
 
     const wantsController =
       options.role === 'controller' || options.role === null || options.role === undefined
