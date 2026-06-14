@@ -333,8 +333,15 @@ export function createRemotePtyRuntime(options: {
       socketHandshakePromise = null
     }
 
+    // Re-drive every tracked session through the bounded attach retry rather than a bare
+    // one-shot sendAttachForSession. On a passive reconnect (heartbeat-terminated socket, TCP
+    // reset) the renderer never re-issues attach, so a dropped attach frame or a server error
+    // (e.g. session.not_found before the session re-registers) would otherwise leave the
+    // session tracked-but-unattached with nothing to clear the in-flight marker or re-send.
+    // ensureSessionAttached coalesces per session and runSessionAttach re-sends after each ack
+    // timeout; ensureSocket() inside it returns immediately because the socket is already OPEN.
     sessionCoordinator.forEachTrackedSession(sessionId => {
-      sessionCoordinator.sendAttachForSession(ws, sessionId)
+      void ensureSessionAttached(sessionId)
     })
   }
 
