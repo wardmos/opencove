@@ -33,7 +33,7 @@ type PtyStreamMessage =
       reason?: string
       recovery?: string
     }
-  | { type: 'control_changed'; sessionId: string }
+  | { type: 'control_changed'; sessionId: string; controller?: unknown; role?: string }
   | { type: 'error'; code?: string; message?: string; sessionId?: string }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -80,6 +80,10 @@ export function createRemotePtyStreamMessageHandler(options: {
   cancelMetadataWatcher: (sessionId: string) => void
   onSessionExit: (sessionId: string) => void
   onSessionAttached: (sessionId: string) => void
+  onControlChanged?: (
+    sessionId: string,
+    info: { hasController: boolean; role: 'viewer' | 'controller' },
+  ) => void
   handshake: {
     onHelloAck: () => void
     onHandshakeError: (error: Error) => void
@@ -125,6 +129,14 @@ export function createRemotePtyStreamMessageHandler(options: {
         options.attachedSessions.set(sessionId, { lastSeq: 0 })
       }
       options.onSessionAttached(sessionId)
+      return
+    }
+
+    if (message.type === 'control_changed') {
+      options.onControlChanged?.(sessionId, {
+        hasController: message.controller !== null && message.controller !== undefined,
+        role: message.role === 'controller' ? 'controller' : 'viewer',
+      })
       return
     }
 

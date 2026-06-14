@@ -19,6 +19,7 @@ export type RemotePtySessionCoordinator = {
   forEachTrackedSession: (callback: (sessionId: string) => void) => void
   hasTrackedSession: (sessionId: string) => boolean
   hasTrackedSessions: () => boolean
+  prefersController: (sessionId: string) => boolean
   updateAttachedSeq: (sessionId: string, seq: number) => void
   clear: () => void
 }
@@ -127,6 +128,11 @@ export function createRemotePtySessionCoordinator(options: {
 
   const onSessionAttached = (sessionId: string): void => {
     streamAttachedSessionIds.add(sessionId)
+    // The attach frame is no longer in-flight once the server acks it. Clearing the
+    // "requested" marker here (not only on timeout / socket close) keeps it scoped to
+    // in-flight attempts, so a later re-attach for a not-yet-acked session is never
+    // permanently suppressed by a stale latch.
+    streamAttachRequestedSessionIds.delete(sessionId)
     const waiters = pendingSessionAttachWaiters.get(sessionId)
     if (!waiters) {
       return
@@ -164,7 +170,15 @@ export function createRemotePtySessionCoordinator(options: {
   }
 
   const sendAttachForSession = (ws: WebSocket, sessionId: string): void => {
-    if (streamAttachRequestedSessionIds.has(sessionId) || !trackedSessionIds.has(sessionId)) {
+    // Skip when the session is untracked, already confirmed-attached on this socket, or has
+    // an attach frame still in-flight. Gating on the "attached" set (rather than only the
+    // "requested" set) lets a tracked-but-unattached session re-issue its attach after a
+    // dropped frame or an attach-ack timeout instead of being stranded for the socket's life.
+    if (
+      !trackedSessionIds.has(sessionId) ||
+      streamAttachedSessionIds.has(sessionId) ||
+      streamAttachRequestedSessionIds.has(sessionId)
+    ) {
       return
     }
 
@@ -262,6 +276,8 @@ export function createRemotePtySessionCoordinator(options: {
     },
     hasTrackedSession: sessionId => trackedSessionIds.has(sessionId),
     hasTrackedSessions: () => trackedSessionIds.size > 0,
+    prefersController: sessionId =>
+      (rolePreferenceBySessionId.get(sessionId) ?? 'controller') === 'controller',
     updateAttachedSeq,
     clear,
   }

@@ -104,4 +104,50 @@ describe('remotePtyRuntime session coordinator', () => {
 
     expect(secondSocket.send).toHaveBeenCalledTimes(1)
   })
+
+  it('re-sends an attach for a tracked session after the attach ack times out', async () => {
+    const coordinator = createRemotePtySessionCoordinator({
+      connectTimeoutMs: 10,
+      cancelMetadataWatcher: vi.fn(),
+      shouldKeepSocketAlive: () => true,
+      closeSocket: vi.fn(),
+      sendDetachMessage: vi.fn(async () => undefined),
+    })
+    const socket = createMockSocket()
+
+    coordinator.trackSession('session-1')
+    coordinator.sendAttachForSession(socket as never, 'session-1')
+    expect(socket.send).toHaveBeenCalledTimes(1)
+
+    // No ack arrives: the wait rejects and the in-flight marker is cleared. The session is
+    // still tracked and unattached on the same open socket, so a re-drive must actually
+    // re-send rather than being suppressed forever (the frozen-restored-terminal bug).
+    await expect(coordinator.waitForSessionAttached('session-1')).rejects.toThrow()
+
+    coordinator.sendAttachForSession(socket as never, 'session-1')
+    expect(socket.send).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not re-send an attach for a session that became attached after its wait timed out', async () => {
+    const coordinator = createRemotePtySessionCoordinator({
+      connectTimeoutMs: 10,
+      cancelMetadataWatcher: vi.fn(),
+      shouldKeepSocketAlive: () => true,
+      closeSocket: vi.fn(),
+      sendDetachMessage: vi.fn(async () => undefined),
+    })
+    const socket = createMockSocket()
+
+    coordinator.trackSession('session-1')
+    coordinator.sendAttachForSession(socket as never, 'session-1')
+    await expect(coordinator.waitForSessionAttached('session-1')).rejects.toThrow()
+
+    // A late ack confirms the server already added this client to the session subscribers.
+    coordinator.onSessionAttached('session-1')
+
+    // Gating on the "attached" set (not only the in-flight marker) prevents a duplicate attach
+    // frame here, which would otherwise trigger a redundant server-side replay.
+    coordinator.sendAttachForSession(socket as never, 'session-1')
+    expect(socket.send).toHaveBeenCalledTimes(1)
+  })
 })

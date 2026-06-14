@@ -33,6 +33,12 @@ import {
   resolveRemotePtyWsUrl,
 } from './remotePtyRuntime.support'
 import { createRemotePtySessionCoordinator } from './remotePtyRuntime.sessionCoordinator'
+
+// Bounded retry for driving a tracked session to attached on an already-open socket. Spans
+// the cold-reopen window so a burst of restored attaches that race / time out still recovers.
+const ATTACH_MAX_ATTEMPTS = 6
+const ATTACH_RETRY_DELAY_MS = 500
+
 export type RemotePtyRuntime = PtyRuntime & {
   noteSessionRolePreference: (sessionId: string, role: 'viewer' | 'controller') => void
 }
@@ -128,6 +134,19 @@ export function createRemotePtyRuntime(options: {
     onSessionExit: sessionId => {
       sessionCoordinator.untrackSession(sessionId)
     },
+    onControlChanged: (sessionId, info) => {
+      // When control is orphaned (no live controller) and this client wants to drive the
+      // session, reclaim it so resize/geometry works again without waiting for a keystroke.
+      // We never contend with a live controller (e.g. another window), only fill an empty
+      // slot — for instance after the server evicts a stale controller on reconnect.
+      if (
+        info.role !== 'controller' &&
+        !info.hasController &&
+        sessionCoordinator.prefersController(sessionId)
+      ) {
+        requestControlForSession(sessionId)
+      }
+    },
     handshake: {
       onHelloAck: () => {
         if (socketHandshakeResolve) {
@@ -146,18 +165,83 @@ export function createRemotePtyRuntime(options: {
     },
   })
 
-  const ensureSessionAttached = async (sessionId: string): Promise<void> => {
+  const inFlightAttachAttempts = new Map<string, Promise<void>>()
+
+  const delay = (ms: number): Promise<void> =>
+    new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref()
+    })
+
+  // Drive a tracked session to "attached" on the server, retrying on the still-open socket.
+  // A single attach can be dropped or time out (e.g. the burst of restored sessions racing on
+  // a freshly reconnected socket after the app reopens). The post-handshake re-attach burst
+  // in connectSocket only fires when a NEW socket is established, so without this retry a
+  // session that fails to attach on an already-open socket would stay tracked-but-unattached
+  // forever: the server would never add it to the session subscribers, so writes are rejected
+  // (session.not_attached) and no output is broadcast — the "frozen restored terminal" bug.
+  const runSessionAttach = async (sessionId: string): Promise<void> => {
+    /* eslint-disable no-await-in-loop -- bounded sequential retries: each attempt depends on the previous one failing, so they cannot run in parallel */
+    for (let attempt = 0; attempt < ATTACH_MAX_ATTEMPTS; attempt += 1) {
+      if (disposed || !sessionCoordinator.hasTrackedSession(sessionId)) {
+        return
+      }
+
+      try {
+        await ensureSocket()
+      } catch {
+        // The socket could not be (re)established yet (endpoint not ready, connect/handshake
+        // failure). Back off and retry so a transient connect failure does not strand the
+        // session; ensureSocket already reset the in-flight attach state on failure.
+        if (disposed || !sessionCoordinator.hasTrackedSession(sessionId)) {
+          return
+        }
+        await delay(ATTACH_RETRY_DELAY_MS)
+        continue
+      }
+
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        await delay(ATTACH_RETRY_DELAY_MS)
+        continue
+      }
+
+      sessionCoordinator.sendAttachForSession(socket, sessionId)
+
+      try {
+        await sessionCoordinator.waitForSessionAttached(sessionId)
+        return
+      } catch {
+        // The attach ack did not arrive in time. The socket is still open and the timeout
+        // already cleared the in-flight marker, so re-send on the next iteration instead of
+        // leaving the session tracked-but-unattached.
+        if (disposed || !sessionCoordinator.hasTrackedSession(sessionId)) {
+          return
+        }
+        await delay(ATTACH_RETRY_DELAY_MS)
+      }
+    }
+    /* eslint-enable no-await-in-loop */
+  }
+
+  const ensureSessionAttached = (sessionId: string): Promise<void> => {
     if (!sessionCoordinator.hasTrackedSession(sessionId)) {
-      return
+      return Promise.resolve()
     }
 
-    await ensureSocket()
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return
+    // Coalesce concurrent callers (e.g. multiple windows attaching, or a spawn racing a
+    // role-preference note) onto a single attach attempt per session.
+    const pending = inFlightAttachAttempts.get(sessionId)
+    if (pending) {
+      return pending
     }
 
-    sessionCoordinator.sendAttachForSession(socket, sessionId)
-    await sessionCoordinator.waitForSessionAttached(sessionId)
+    const attempt = runSessionAttach(sessionId).finally(() => {
+      if (inFlightAttachAttempts.get(sessionId) === attempt) {
+        inFlightAttachAttempts.delete(sessionId)
+      }
+    })
+    inFlightAttachAttempts.set(sessionId, attempt)
+    return attempt
   }
 
   const connectSocket = async (): Promise<void> => {
@@ -286,6 +370,14 @@ export function createRemotePtyRuntime(options: {
     }
 
     socket.send(JSON.stringify(payload))
+  }
+
+  const requestControlForSession = (sessionId: string): void => {
+    if (!sessionCoordinator.hasTrackedSession(sessionId)) {
+      return
+    }
+
+    void sendSocketMessage({ type: 'request_control', sessionId }).catch(() => undefined)
   }
 
   const noteSessionRolePreference = (sessionId: string, role: 'viewer' | 'controller'): void => {

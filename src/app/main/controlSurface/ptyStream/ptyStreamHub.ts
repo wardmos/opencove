@@ -75,6 +75,16 @@ export class PtyStreamHub {
     })
   }
 
+  private hasLiveController(session: SessionState): boolean {
+    const controllerClientId = session.controllerClientId
+    if (!controllerClientId) {
+      return false
+    }
+
+    const controller = this.clients.get(controllerClientId)
+    return controller !== undefined && controller.ws.readyState === controller.ws.OPEN
+  }
+
   public registerClient(options: {
     clientId: string
     kind: PtyStreamClientKind
@@ -308,6 +318,14 @@ export class PtyStreamHub {
     }
 
     this.flushSession(session)
+
+    // Drop a controller that no longer maps to a live, open socket (e.g. the previous client
+    // quit but its TCP close has not been processed yet). Otherwise a stale controllerClientId
+    // would demote every reconnecting client to viewer, blocking resize until a keystroke
+    // self-promotes it.
+    if (session.controllerClientId && !this.hasLiveController(session)) {
+      this.setSessionController(session, null)
+    }
 
     const wantsController =
       options.role === 'controller' || options.role === null || options.role === undefined
