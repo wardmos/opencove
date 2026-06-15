@@ -19,7 +19,10 @@ concurrency:
 
 env:
   # Prerelease version derived from the run number so every push is unique.
-  SELF_VERSION: 0.2.0-self.${{ github.run_number }}
+  # The `-nightly.` marker routes through the prerelease path in
+  # generate-release-manifest.mjs, which auto-generates release notes
+  # (curated notes are only required for stable, non-prerelease versions).
+  SELF_VERSION: 0.2.0-nightly.self.${{ github.run_number }}
 
 jobs:
   build:
