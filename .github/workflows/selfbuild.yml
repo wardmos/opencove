@@ -58,12 +58,20 @@ jobs:
               set +u
               for e in /opt/rh/gcc-toolset-*/enable; do [ -f "$e" ] && . "$e"; done
               set -u
-              dnf install -y -q xz python3 >/dev/null
               gcc --version | head -1
 
-              # Node 22 official binary (minimum glibc 2.28).
-              curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz -o /tmp/node.tar.xz
-              tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+              # node-gyp (used by electron-builder install-app-deps) needs
+              # Python >= 3.8 (walrus operator); the system python is 3.6, so use
+              # the newest CPython manylinux ships in /opt/python.
+              PYDIR=$(ls -d /opt/python/cp31[0-9]-* | sort -V | tail -1)
+              export PATH="$PYDIR/bin:$PATH"
+              export npm_config_python="$PYDIR/bin/python3"
+              python3 --version
+
+              # Node 22 official binary (minimum glibc 2.28). Use .tar.gz so we
+              # do not depend on xz being present in the image.
+              curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.gz -o /tmp/node.tar.gz
+              tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1
               node -v
 
               corepack enable
