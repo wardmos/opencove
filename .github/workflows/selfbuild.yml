@@ -42,23 +42,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build standalone server in Debian buster (glibc 2.28)
+      - name: Build standalone server in manylinux_2_28 (glibc 2.28, gcc 14)
         run: |
           docker run --rm \
             -e SELF_VERSION \
             -e CSC_IDENTITY_AUTO_DISCOVERY=false \
             -e npm_config_build_from_source=true \
             -v "$PWD":/work -w /work \
-            debian:buster \
+            quay.io/pypa/manylinux_2_28_x86_64 \
             bash -euxo pipefail -c '
-              # buster is EOL: point apt at the archive mirror.
-              printf "deb http://archive.debian.org/debian buster main\n" > /etc/apt/sources.list
-              printf "deb http://archive.debian.org/debian-security buster/updates main\n" >> /etc/apt/sources.list
-              apt-get -o Acquire::Check-Valid-Until=false update
-              apt-get install -y --no-install-recommends \
-                curl xz-utils ca-certificates git python3 g++ make
+              # manylinux_2_28 = glibc 2.28 (matches Debian 10) plus a modern
+              # gcc-toolset that supports C++20 (better-sqlite3 requires it; the
+              # buster gcc 8 does not) and statically links the newer libstdc++
+              # symbols so the result still runs on old hosts.
+              set +u
+              for e in /opt/rh/gcc-toolset-*/enable; do [ -f "$e" ] && . "$e"; done
+              set -u
+              dnf install -y -q xz python3 >/dev/null
+              gcc --version | head -1
 
-              # Node 22 official binary (minimum glibc 2.28, matches buster).
+              # Node 22 official binary (minimum glibc 2.28).
               curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz -o /tmp/node.tar.xz
               tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
               node -v
