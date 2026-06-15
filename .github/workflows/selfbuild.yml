@@ -1,0 +1,120 @@
+name: Self Build
+
+# Personal build pipeline for this fork. Pushing to the `selfbuild` branch
+# builds unsigned Linux + macOS arm64 packages and publishes them as a
+# prerelease in this repository's Releases (not just run-page artifacts).
+
+on:
+  push:
+    branches:
+      - selfbuild
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: selfbuild-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Prerelease version derived from the run number so every push is unique.
+  SELF_VERSION: 0.2.0-self.${{ github.run_number }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux
+            runner: ubuntu-latest
+            build_command: pnpm build:linux
+            artifact_name: linux
+          - label: macOS arm64
+            runner: macos-15
+            build_command: pnpm build:mac:arm64
+            artifact_name: macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.6.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Cache Electron binaries
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ env.ELECTRON_CACHE }}
+            ${{ env.ELECTRON_BUILDER_CACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply self-build version
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.SELF_VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          echo "package.json version => $(node -p "require('./package.json').version")"
+
+      - name: Build release artifacts (unsigned)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: ${{ matrix.build_command }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: selfbuild-${{ matrix.artifact_name }}
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.dmg
+            dist/*.zip
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish Self Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: selfbuild-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: selfbuild-${{ env.SELF_VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: Self Build ${{ env.SELF_VERSION }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: |
+            release-assets/*
