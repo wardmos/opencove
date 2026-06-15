@@ -9,6 +9,7 @@ import type { PtyStreamHub } from '../ptyStream/ptyStreamHub'
 import { normalizeAgentSettings } from '../../../../contexts/settings/domain/agentSettings'
 import { normalizeOptionalString } from './sessionLaunchPayloadSupport'
 import {
+  logPrepareOrReviveDiagnostic,
   normalizePersistedAppState,
   normalizePersistedAgent,
   normalizeWorkspaceIdPayload,
@@ -90,12 +91,33 @@ export function registerSessionPrepareOrReviveHandler(
         return !nodeIdFilter || nodeIdFilter.has(node.id)
       })
 
+      logPrepareOrReviveDiagnostic('info', 'prepareOrRevive request', {
+        workspaceId: workspace.id,
+        requestedNodeIds: payload.nodeIds ?? null,
+        runtimeNodeCount: runtimeNodes.length,
+        runtimeNodeIds: runtimeNodes.map(node => node.id),
+      })
+
       const preparedNodes = await mapWithConcurrency(
         runtimeNodes,
         PREPARE_OR_REVIVE_CONCURRENCY,
         async (node): Promise<PreparedRuntimeNodeResult | null> => {
           const existingSessionId = normalizeOptionalString(node.sessionId)
-          if (existingSessionId && deps.ptyStreamHub.hasSession(existingSessionId)) {
+          const hasLiveSession =
+            existingSessionId !== null && deps.ptyStreamHub.hasSession(existingSessionId)
+          logPrepareOrReviveDiagnostic('info', 'preparing node', {
+            nodeId: node.id,
+            kind: node.kind,
+            status: node.status ?? null,
+            existingSessionId: existingSessionId ?? null,
+            hasLiveSession,
+            decision: hasLiveSession
+              ? 'reattach-live'
+              : node.kind === 'agent'
+                ? 'agent-prepare'
+                : 'terminal-spawn',
+          })
+          if (existingSessionId && hasLiveSession) {
             const scrollback =
               node.kind === 'agent'
                 ? null
@@ -152,6 +174,17 @@ export function registerSessionPrepareOrReviveHandler(
         },
       )
       const nodes = preparedNodes.filter((node): node is PreparedRuntimeNodeResult => node !== null)
+
+      logPrepareOrReviveDiagnostic('info', 'prepareOrRevive result', {
+        workspaceId: workspace.id,
+        nodes: nodes.map(node => ({
+          nodeId: node.nodeId,
+          sessionId: node.sessionId.length > 0 ? node.sessionId : null,
+          recoveryState: node.recoveryState,
+          isLiveSessionReattach: node.isLiveSessionReattach,
+          lastError: node.lastError ?? null,
+        })),
+      })
 
       return {
         workspaceId: workspace.id,

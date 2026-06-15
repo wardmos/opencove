@@ -22,6 +22,7 @@ import {
   invokeCommand,
   isActiveAgentStatus,
   isRecoverableAgentWindowStatus,
+  logPrepareOrReviveDiagnostic,
   resolveNodeProfileId,
   resolvePreparedScrollback,
   resolveNodeRuntimeKind,
@@ -114,6 +115,11 @@ export async function prepareTerminalNode(options: {
     store: options.store,
     node: options.node,
   })
+  logPrepareOrReviveDiagnostic('info', 'spawning fallback terminal', {
+    nodeId: options.node.id,
+    cwd,
+    profileId: resolveNodeProfileId(options.node),
+  })
   try {
     const spawned = await spawnFallbackTerminal({
       controlSurface: options.controlSurface,
@@ -125,6 +131,10 @@ export async function prepareTerminalNode(options: {
       geometry: spawnGeometry,
     })
 
+    logPrepareOrReviveDiagnostic('info', 'terminal spawn succeeded', {
+      nodeId: options.node.id,
+      sessionId: spawned.sessionId,
+    })
     return toPreparedNodeResult(options.node, {
       recoveryState: 'restarted',
       sessionId: spawned.sessionId,
@@ -143,6 +153,12 @@ export async function prepareTerminalNode(options: {
       agent: null,
     })
   } catch (error) {
+    logPrepareOrReviveDiagnostic('error', 'terminal spawn FAILED', {
+      nodeId: options.node.id,
+      cwd,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? (error.stack ?? null) : null,
+    })
     return toPreparedNodeResult(options.node, {
       recoveryState: 'restarted',
       sessionId: '',

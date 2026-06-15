@@ -182,6 +182,18 @@ export function formatRecoverableError(fallbackMessage: string, error: unknown):
   return detail && detail.length > 0 ? `${fallbackMessage}: ${detail}` : fallbackMessage
 }
 
+// Worker-side diagnostics for terminal/agent revive. These print to the worker's stdout (captured
+// in managed-worker.log) so a frozen terminal's real cause — reattach miss vs spawn failure with
+// the underlying error — is visible without the renderer guessing.
+export function logPrepareOrReviveDiagnostic(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  // eslint-disable-next-line no-console -- revive failures must be visible in the worker log to diagnose frozen terminals
+  console[level](`[opencove][prepare] ${message}`, details ? JSON.stringify(details) : '')
+}
+
 export async function invokeCommand<TResult>(
   controlSurface: ControlSurface,
   ctx: ControlSurfaceContext,

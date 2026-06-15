@@ -292,7 +292,7 @@ export function useHydrateAppState({
       }
 
       // Terminals that still have no sessionId after this pass (revive failed) — caller retries these.
-      return targetTerminalIds.filter(id => {
+      const stillEmptyTerminalIds = targetTerminalIds.filter(id => {
         const hydratedNode = hydratedById.get(id)
         const sessionId =
           hydratedNode && typeof hydratedNode.data.sessionId === 'string'
@@ -300,6 +300,25 @@ export function useHydrateAppState({
             : ''
         return sessionId.length === 0
       })
+
+      if (stillEmptyTerminalIds.length > 0) {
+        // Surface WHY each terminal failed to revive (worker spawn/reattach error), so the freeze
+        // is diagnosable from the console instead of just "still without a session".
+        logHydrationDiagnostic('warn', 'terminals returned without a session after revive pass', {
+          workspaceId,
+          terminals: stillEmptyTerminalIds.map(id => {
+            const hydratedNode = hydratedById.get(id)
+            return {
+              nodeId: id,
+              returnedByWorker: hydratedById.has(id),
+              status: hydratedNode?.data.status ?? null,
+              lastError: hydratedNode?.data.lastError ?? null,
+            }
+          }),
+        })
+      }
+
+      return stillEmptyTerminalIds
     },
     [setWorkspaces],
   )
