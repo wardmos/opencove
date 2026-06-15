@@ -13,8 +13,10 @@ import { useScrollbackStore } from '@contexts/workspace/presentation/renderer/st
 import { readPersistedStateWithMeta } from '@contexts/workspace/presentation/renderer/utils/persistence'
 import { getPersistencePort } from '@contexts/workspace/presentation/renderer/utils/persistence/port'
 import { resolveCanvasCanonicalBucketFromViewport } from '@contexts/workspace/presentation/renderer/utils/workspaceNodeSizing'
+import { toRuntimeNodes } from '@contexts/workspace/presentation/renderer/utils/nodeTransform'
 import { useAppStore } from '../store/useAppStore'
 import {
+  logHydrationDiagnostic,
   mergeHydratedNode,
   prepareWorkspaceRuntimeNodes,
   toShellWorkspaceState,
@@ -40,6 +42,16 @@ async function delay(ms: number): Promise<void> {
     window.setTimeout(resolve, ms)
   })
 }
+
+// Restored terminals whose session fails to revive on the first hydration pass (e.g. the remote
+// worker connection is not ready yet on app reopen) come back with an empty sessionId. Hydration
+// runs once per workspace with no retry, so those panes render their persisted scrollback but never
+// attach — frozen. Re-drive prepareOrRevive for just those nodes with backoff; each pass stops a
+// node as soon as it gets a sessionId (reattaching the still-live session when possible, otherwise
+// spawning a fresh one), so this never duplicates sessions and converges once the worker is reachable.
+const FROZEN_TERMINAL_RETRY_MAX_ATTEMPTS = 24
+const FROZEN_TERMINAL_RETRY_BASE_DELAY_MS = 1_000
+const FROZEN_TERMINAL_RETRY_MAX_DELAY_MS = 8_000
 
 export function useHydrateAppState({
   activeWorkspaceId,
@@ -232,39 +244,130 @@ export function useHydrateAppState({
   )
 
   const hydrateWorkspaceRuntimeNodes = useCallback(
-    async (workspaceId: string, persistedWorkspace: PersistedWorkspaceState): Promise<void> => {
+    async (
+      workspaceId: string,
+      persistedWorkspace: PersistedWorkspaceState,
+      nodeIds?: string[] | null,
+    ): Promise<string[]> => {
       if (isCancelledRef.current) {
-        return
+        return []
       }
+
+      const targetTerminalIds =
+        nodeIds && nodeIds.length > 0
+          ? nodeIds
+          : toRuntimeNodes(persistedWorkspace)
+              .filter(node => node.data.kind === 'terminal')
+              .map(node => node.id)
 
       const { agentSettings } = useAppStore.getState()
       const hydratedNodes = await prepareWorkspaceRuntimeNodes({
         workspace: persistedWorkspace,
         agentSettings,
+        ...(nodeIds && nodeIds.length > 0 ? { nodeIds } : {}),
       })
 
-      if (isCancelledRef.current || hydratedNodes.length === 0) {
-        return
+      if (isCancelledRef.current) {
+        return []
       }
 
       const hydratedById = new Map(hydratedNodes.map(node => [node.id, node]))
-      setWorkspaces(previous =>
-        previous.map(workspace => {
-          if (workspace.id !== workspaceId) {
-            return workspace
-          }
 
-          return {
-            ...workspace,
-            nodes: workspace.nodes.map(node => {
-              const hydratedNode = hydratedById.get(node.id)
-              return hydratedNode ? mergeHydratedNode(node, hydratedNode) : node
-            }),
-          }
-        }),
-      )
+      if (hydratedNodes.length > 0) {
+        setWorkspaces(previous =>
+          previous.map(workspace => {
+            if (workspace.id !== workspaceId) {
+              return workspace
+            }
+
+            return {
+              ...workspace,
+              nodes: workspace.nodes.map(node => {
+                const hydratedNode = hydratedById.get(node.id)
+                return hydratedNode ? mergeHydratedNode(node, hydratedNode) : node
+              }),
+            }
+          }),
+        )
+      }
+
+      // Terminals that still have no sessionId after this pass (revive failed) — caller retries these.
+      return targetTerminalIds.filter(id => {
+        const hydratedNode = hydratedById.get(id)
+        const sessionId =
+          hydratedNode && typeof hydratedNode.data.sessionId === 'string'
+            ? hydratedNode.data.sessionId.trim()
+            : ''
+        return sessionId.length === 0
+      })
     },
     [setWorkspaces],
+  )
+
+  const retryFrozenRuntimeNodes = useCallback(
+    async (
+      workspaceId: string,
+      persistedWorkspace: PersistedWorkspaceState,
+      initialEmptyNodeIds: string[],
+    ): Promise<void> => {
+      logHydrationDiagnostic(
+        'warn',
+        'terminals have no session after initial revive; starting background retry',
+        { workspaceId, count: initialEmptyNodeIds.length, nodeIds: initialEmptyNodeIds },
+      )
+
+      let emptyNodeIds = initialEmptyNodeIds
+      let attempts = 0
+      /* eslint-disable no-await-in-loop -- sequential backoff retries: each pass depends on the previous one's result, so they cannot run in parallel */
+      for (
+        let attempt = 0;
+        attempt < FROZEN_TERMINAL_RETRY_MAX_ATTEMPTS && emptyNodeIds.length > 0;
+        attempt += 1
+      ) {
+        if (isCancelledRef.current) {
+          return
+        }
+
+        await delay(
+          Math.min(
+            FROZEN_TERMINAL_RETRY_BASE_DELAY_MS * 2 ** attempt,
+            FROZEN_TERMINAL_RETRY_MAX_DELAY_MS,
+          ),
+        )
+
+        if (isCancelledRef.current) {
+          return
+        }
+
+        emptyNodeIds = await hydrateWorkspaceRuntimeNodes(
+          workspaceId,
+          persistedWorkspace,
+          emptyNodeIds,
+        )
+        attempts = attempt + 1
+        logHydrationDiagnostic(
+          'info',
+          `revive retry ${attempts}: ${emptyNodeIds.length} terminal(s) still without a session`,
+          { workspaceId, nodeIds: emptyNodeIds },
+        )
+      }
+      /* eslint-enable no-await-in-loop */
+
+      if (isCancelledRef.current) {
+        return
+      }
+
+      if (emptyNodeIds.length === 0) {
+        logHydrationDiagnostic('info', 'all frozen terminals revived', { workspaceId, attempts })
+      } else {
+        logHydrationDiagnostic(
+          'error',
+          'terminals still have no session after max retries (still frozen)',
+          { workspaceId, nodeIds: emptyNodeIds, attempts },
+        )
+      }
+    },
+    [hydrateWorkspaceRuntimeNodes],
   )
 
   const ensureWorkspaceHydrated = useCallback(
@@ -303,8 +406,13 @@ export function useHydrateAppState({
       }
 
       const hydrationPromise = hydrateWorkspaceRuntimeNodes(workspaceId, persistedWorkspace)
-        .then(() => {
+        .then(emptyNodeIds => {
           hydratedWorkspaceIdsRef.current.add(workspaceId)
+          if (emptyNodeIds.length > 0 && !isCancelledRef.current) {
+            // Self-heal terminals that failed to revive on the first pass (e.g. the remote worker
+            // connection was not ready yet) in the background, instead of leaving them frozen.
+            void retryFrozenRuntimeNodes(workspaceId, persistedWorkspace, emptyNodeIds)
+          }
         })
         .finally(() => {
           hydratingWorkspacePromisesRef.current.delete(workspaceId)
@@ -314,7 +422,12 @@ export function useHydrateAppState({
       hydratingWorkspacePromisesRef.current.set(workspaceId, hydrationPromise)
       await hydrationPromise
     },
-    [ensureWorkspaceScrollbacksLoaded, hydrateWorkspaceRuntimeNodes, markInitialHydrationComplete],
+    [
+      ensureWorkspaceScrollbacksLoaded,
+      hydrateWorkspaceRuntimeNodes,
+      markInitialHydrationComplete,
+      retryFrozenRuntimeNodes,
+    ],
   )
 
   useEffect(() => {

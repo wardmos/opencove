@@ -12,6 +12,15 @@ import { mergeScrollbackSnapshots } from '@contexts/workspace/presentation/rende
 import { hydrateAgentNode } from '@contexts/agent/presentation/renderer/hydrateAgentNode'
 import { repairRuntimeNodeFrame } from './runtimeNodeFrameRepair'
 
+export function logHydrationDiagnostic(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  // eslint-disable-next-line no-console -- runtime restore failures were previously swallowed silently; always surface them in the DevTools console so frozen terminals are diagnosable
+  console[level](`[opencove][hydrate] ${message}`, details ?? '')
+}
+
 export function toShellWorkspaceState(
   workspace: PersistedWorkspaceState,
   options?: { dropRuntimeSessionIds?: boolean },
@@ -346,7 +355,16 @@ export async function prepareWorkspaceRuntimeNodes({
 
         preparedById.set(currentNode.id, toHydratedRuntimeNode(currentNode, preparedNode))
       }
-    } catch {
+    } catch (error) {
+      logHydrationDiagnostic(
+        'warn',
+        'session.prepareOrRevive invoke failed; runtime nodes left unhydrated (will be retried)',
+        {
+          workspaceId: workspace.id,
+          nodeIds: runtimeNodes.map(node => node.id),
+          error: error instanceof Error ? error.message : String(error),
+        },
+      )
       if (shouldRequireWorker) {
         return []
       }
