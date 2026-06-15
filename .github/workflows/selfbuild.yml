@@ -83,6 +83,11 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: ${{ matrix.build_command }}
 
+      - name: Build standalone server bundle (unsigned)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm build:standalone:asset
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -94,6 +99,8 @@ jobs:
             dist/*.zip
             dist/*.blockmap
             dist/latest*.yml
+            dist/opencove-server-*.tar.gz
+            dist/opencove-server-*.zip
           if-no-files-found: error
           retention-days: 7
 
