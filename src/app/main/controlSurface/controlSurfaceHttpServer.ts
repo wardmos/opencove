@@ -2,6 +2,10 @@ import { createServer, type ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { createAppErrorDescriptor } from '../../../shared/errors/appError'
 import { createControlSurface } from './controlSurface'
+import {
+  describeControlSurfaceError,
+  logControlSurfaceError,
+} from './controlSurfaceDiagnostics'
 import { normalizeInvokeRequest } from './validate'
 import type { ControlSurfaceContext } from './types'
 import { renderWorkerWebShellPage } from './workerWebShellPage'
@@ -350,6 +354,14 @@ export function registerControlSurfaceHttpServer(
       }
       sendJson(res, 200, result)
     } catch (error) {
+      // Reaches here for body-read / request-normalization failures (and any
+      // error escaping controlSurface.invoke); all are flattened to a generic
+      // `common.invalid_input` for the client, so log the real cause server-side.
+      logControlSurfaceError(
+        'http-invoke:failed',
+        'Control surface HTTP request failed before producing a result.',
+        { authKind: auth.kind, ...describeControlSurfaceError(error) },
+      )
       sendJson(res, 400, {
         __opencoveControlEnvelope: true,
         ok: false,

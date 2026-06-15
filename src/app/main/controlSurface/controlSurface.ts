@@ -4,6 +4,11 @@ import type {
   ControlSurfaceInvokeResult,
 } from '../../../shared/contracts/controlSurface'
 import type { ControlSurfaceContext, ControlSurfaceHandler } from './types'
+import {
+  describeControlSurfaceError,
+  logControlSurfaceError,
+  logControlSurfaceInfo,
+} from './controlSurfaceDiagnostics'
 
 export interface ControlSurface {
   register: <TPayload, TResult>(
@@ -28,8 +33,19 @@ export function createControlSurface(): ControlSurface {
       handlers.set(id, handler as ControlSurfaceHandler<unknown, unknown>)
     },
     invoke: async (ctx, request) => {
+      logControlSurfaceInfo('invoke:start', 'Control surface invoke received.', {
+        id: request.id,
+        kind: request.kind,
+      })
+
       const handler = handlers.get(request.id)
       if (!handler || handler.kind !== request.kind) {
+        logControlSurfaceError('invoke:unknown-handler', 'No handler matched the request.', {
+          id: request.id,
+          kind: request.kind,
+          handlerRegistered: !!handler,
+          registeredKind: handler ? handler.kind : null,
+        })
         return {
           __opencoveControlEnvelope: true,
           ok: false,
@@ -40,20 +56,37 @@ export function createControlSurface(): ControlSurface {
         }
       }
 
+      // Track which phase failed so a `common.invalid_input` raised while
+      // validating the payload is distinguishable from one raised inside the
+      // handler body.
+      let phase: 'validate' | 'handle' = 'validate'
       try {
         const payload = handler.validate(request.payload)
+        phase = 'handle'
         const value = await handler.handle(ctx, payload)
 
+        logControlSurfaceInfo('invoke:succeeded', 'Control surface invoke succeeded.', {
+          id: request.id,
+          kind: request.kind,
+        })
         return {
           __opencoveControlEnvelope: true,
           ok: true,
           value,
         }
       } catch (error) {
+        const descriptor = toAppErrorDescriptor(error, handler.defaultErrorCode)
+        logControlSurfaceError('invoke:failed', 'Control surface invoke failed.', {
+          id: request.id,
+          kind: request.kind,
+          phase,
+          resolvedErrorCode: descriptor.code,
+          ...describeControlSurfaceError(error),
+        })
         return {
           __opencoveControlEnvelope: true,
           ok: false,
-          error: toAppErrorDescriptor(error, handler.defaultErrorCode),
+          error: descriptor,
         }
       }
     },
