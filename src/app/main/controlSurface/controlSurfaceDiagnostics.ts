@@ -1,9 +1,11 @@
-import { app } from 'electron'
 import { appendFileSync, mkdirSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 import process from 'node:process'
 import { OpenCoveAppError } from '../../../shared/errors/appError'
 import type { RuntimeDiagnosticsDetailValue } from '../../../shared/contracts/dto'
+
+const require = createRequire(import.meta.url)
 
 // Control-surface diagnostics are always on (no env toggle): the terminal-launch
 // path is the primary support pain point, so we want the trace available without
@@ -16,9 +18,39 @@ function truncate(value: string, maxLength = 500): string {
   return `${value.slice(0, maxLength)}...<truncated:${value.length}>`
 }
 
-function appendRuntimeDiagnosticsFile(line: string): void {
+// Resolve the directory the runtime diagnostics log lives in. Prefer the Electron
+// main-process userData dir, looked up lazily: the worker entry runs under
+// ELECTRON_RUN_AS_NODE where `electron` resolves to a path string (or fails to
+// resolve), so importing it at module load would crash the worker. When Electron
+// is unavailable, fall back to OPENCOVE_USER_DATA_DIR, which the main process
+// injects when it spawns the worker.
+function resolveUserDataDir(): string | null {
   try {
-    const filePath = resolve(app.getPath('userData'), 'logs', 'runtime-diagnostics.log')
+    const electron = require('electron') as
+      | { app?: { getPath?: (name: string) => string } }
+      | string
+    if (electron && typeof electron !== 'string') {
+      const dir = electron.app?.getPath?.('userData')
+      if (typeof dir === 'string' && dir.trim().length > 0) {
+        return dir
+      }
+    }
+  } catch {
+    // Not an Electron main process; fall through to the env-based path.
+  }
+
+  const envDir = process.env['OPENCOVE_USER_DATA_DIR']?.trim()
+  return envDir && envDir.length > 0 ? envDir : null
+}
+
+function appendRuntimeDiagnosticsFile(line: string): void {
+  const userDataDir = resolveUserDataDir()
+  if (!userDataDir) {
+    return
+  }
+
+  try {
+    const filePath = resolve(userDataDir, 'logs', 'runtime-diagnostics.log')
     mkdirSync(dirname(filePath), { recursive: true })
     appendFileSync(filePath, `${line}\n`, { encoding: 'utf8', mode: 0o600 })
   } catch {
