@@ -60,6 +60,10 @@ jobs:
               set -u
               gcc --version | head -1
 
+              # /work is bind-mounted from the host runner user; allow the
+              # container root to run git in it (release manifest reads git tags).
+              git config --global --add safe.directory /work
+
               # node-gyp (used by electron-builder install-app-deps) needs
               # Python >= 3.8 (walrus operator); the system python is 3.6, so use
               # the newest CPython manylinux ships in /opt/python.
