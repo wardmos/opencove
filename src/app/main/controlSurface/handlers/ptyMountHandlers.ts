@@ -14,11 +14,22 @@ import type { MultiEndpointPtyRuntime } from '../ptyStream/multiEndpointPtyRunti
 import type { PtyStreamHub } from '../ptyStream/ptyStreamHub'
 import { invokeControlSurface } from '../remote/controlSurfaceHttpClient'
 import { normalizeEnvPayload } from '../../ipc/normalize'
+import {
+  describeControlSurfaceError,
+  logControlSurfaceError,
+  logControlSurfaceInfo,
+} from '../controlSurfaceDiagnostics'
 
 const terminalProfileResolver = new TerminalProfileResolver()
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function truncate(value: string, maxLength = 320): string {
+  return value.length <= maxLength
+    ? value
+    : `${value.slice(0, maxLength)}...<truncated:${value.length}>`
 }
 
 function normalizeOptionalString(value: unknown): string | null {
@@ -180,21 +191,59 @@ export function registerPtyMountHandlers(
     kind: 'command',
     validate: normalizeSpawnInMountPayload,
     handle: async (ctx, payload): Promise<SpawnTerminalResult> => {
+      logControlSurfaceInfo('pty-spawn-in-mount:start', 'Spawning terminal in mount.', {
+        mountId: payload.mountId,
+        hasCwdUri: !!payload.cwdUri,
+        profileId: payload.profileId ?? null,
+        shell: payload.shell ?? null,
+        hasCommand: !!payload.command,
+        argCount: payload.args?.length ?? 0,
+        cols: payload.cols ?? null,
+        rows: payload.rows ?? null,
+        hasEnv: !!payload.env,
+      })
+
       const target = await deps.topology.resolveMountTarget({ mountId: payload.mountId })
       if (!target) {
+        logControlSurfaceError(
+          'pty-spawn-in-mount:unknown-mount',
+          'Mount target could not be resolved.',
+          { mountId: payload.mountId },
+        )
         throw createAppError('common.invalid_input', {
           debugMessage: `Unknown mountId: ${payload.mountId}`,
         })
       }
 
       const cwdUri = payload.cwdUri ?? target.rootUri
-      assertFileUriWithinRootUri({
-        rootUri: target.rootUri,
-        uri: cwdUri,
-        debugMessage: 'pty.spawnInMount cwdUri is outside mount root',
-      })
+      try {
+        assertFileUriWithinRootUri({
+          rootUri: target.rootUri,
+          uri: cwdUri,
+          debugMessage: 'pty.spawnInMount cwdUri is outside mount root',
+        })
+      } catch (error) {
+        logControlSurfaceError(
+          'pty-spawn-in-mount:cwd-outside-root',
+          'Requested cwd is outside the mount root.',
+          {
+            mountId: payload.mountId,
+            endpointId: target.endpointId,
+            rootUri: truncate(target.rootUri),
+            cwdUri: truncate(cwdUri),
+            usedDefaultCwd: !payload.cwdUri,
+            ...describeControlSurfaceError(error),
+          },
+        )
+        throw error
+      }
 
       const cwd = resolvePathFromUriOrThrow(cwdUri, 'pty.spawnInMount cwdUri')
+      logControlSurfaceInfo('pty-spawn-in-mount:cwd-resolved', 'Resolved mount cwd.', {
+        mountId: payload.mountId,
+        endpointId: target.endpointId,
+        cwd: truncate(cwd),
+      })
       const cols = payload.cols ?? 80
       const rows = payload.rows ?? 24
       const profileId = normalizeOptionalString(payload.profileId)
@@ -204,14 +253,23 @@ export function registerPtyMountHandlers(
 
       if (target.endpointId === 'local') {
         const isApproved = await deps.approvedWorkspaces.isPathApproved(cwd)
+        logControlSurfaceInfo('pty-spawn-in-mount:approval-checked', 'Checked workspace approval.', {
+          cwd: truncate(cwd),
+          isApproved,
+        })
         if (!isApproved) {
+          logControlSurfaceError(
+            'pty-spawn-in-mount:approval-rejected',
+            'cwd is outside approved roots.',
+            { cwd: truncate(cwd) },
+          )
           throw createAppError('common.approved_path_required', {
             debugMessage: 'pty.spawnInMount cwd is outside approved roots',
           })
         }
 
-        const resolvedSpawn = payload.command
-          ? await terminalProfileResolver.resolveCommandSpawn({
+        const resolvedSpawn = await (payload.command
+          ? terminalProfileResolver.resolveCommandSpawn({
               cwd,
               profileId,
               command: payload.command,
@@ -219,7 +277,7 @@ export function registerPtyMountHandlers(
               env: payload.env ?? undefined,
               commandEnv: payload.env ?? undefined,
             })
-          : await terminalProfileResolver.resolveTerminalSpawn({
+          : terminalProfileResolver.resolveTerminalSpawn({
               cwd,
               cols,
               rows,
@@ -227,14 +285,51 @@ export function registerPtyMountHandlers(
               ...(shell ? { shell } : {}),
               ...(payload.env ? { env: payload.env } : {}),
             })
+        ).catch(error => {
+          logControlSurfaceError(
+            'pty-spawn-in-mount:spawn-resolve-failed',
+            'Failed to resolve terminal spawn.',
+            {
+              cwd: truncate(cwd),
+              profileId,
+              shell,
+              hasCommand: !!payload.command,
+              ...describeControlSurfaceError(error),
+            },
+          )
+          throw error
+        })
+        logControlSurfaceInfo('pty-spawn-in-mount:spawn-resolved', 'Resolved terminal spawn.', {
+          cwd: truncate(resolvedSpawn.cwd),
+          command: truncate(resolvedSpawn.command),
+          argCount: resolvedSpawn.args.length,
+          profileId: resolvedSpawn.profileId,
+          runtimeKind: resolvedSpawn.runtimeKind,
+        })
 
-        const { sessionId } = await deps.ptyRuntime.spawnSession({
-          cwd: resolvedSpawn.cwd,
-          cols,
-          rows,
-          command: resolvedSpawn.command,
-          args: resolvedSpawn.args,
-          env: resolvedSpawn.env,
+        const { sessionId } = await deps.ptyRuntime
+          .spawnSession({
+            cwd: resolvedSpawn.cwd,
+            cols,
+            rows,
+            command: resolvedSpawn.command,
+            args: resolvedSpawn.args,
+            env: resolvedSpawn.env,
+          })
+          .catch(error => {
+            logControlSurfaceError('pty-spawn-in-mount:spawn-failed', 'PTY spawn failed.', {
+              cwd: truncate(resolvedSpawn.cwd),
+              command: truncate(resolvedSpawn.command),
+              cols,
+              rows,
+              ...describeControlSurfaceError(error),
+            })
+            throw error
+          })
+        logControlSurfaceInfo('pty-spawn-in-mount:spawned', 'Local terminal session spawned.', {
+          sessionId,
+          cwd: truncate(resolvedSpawn.cwd),
+          runtimeKind: resolvedSpawn.runtimeKind,
         })
 
         deps.ptyStreamHub.registerSessionMetadata({
@@ -255,8 +350,18 @@ export function registerPtyMountHandlers(
         }
       }
 
+      logControlSurfaceInfo(
+        'pty-spawn-in-mount:remote-dispatch',
+        'Dispatching terminal spawn to remote endpoint.',
+        { endpointId: target.endpointId, cwd: truncate(cwd) },
+      )
       const endpoint = await deps.topology.resolveRemoteEndpointConnection(target.endpointId)
       if (!endpoint) {
+        logControlSurfaceError(
+          'pty-spawn-in-mount:remote-endpoint-unavailable',
+          'Remote endpoint connection is unavailable.',
+          { endpointId: target.endpointId },
+        )
         throw createAppError('worker.unavailable', {
           debugMessage: `Remote endpoint unavailable: ${target.endpointId}`,
         })
@@ -278,10 +383,22 @@ export function registerPtyMountHandlers(
         kind: 'command',
         id: 'pty.spawn',
         payload: remoteSpawnPayload,
+      }).catch(error => {
+        logControlSurfaceError(
+          'pty-spawn-in-mount:remote-spawn-failed',
+          'Remote pty.spawn invocation failed.',
+          { endpointId: target.endpointId, cwd: truncate(cwd), ...describeControlSurfaceError(error) },
+        )
+        throw error
       })
 
       const remoteSessionId = normalizeOptionalString(remoteResult.sessionId)
       if (!remoteSessionId) {
+        logControlSurfaceError(
+          'pty-spawn-in-mount:remote-invalid-session',
+          'Remote pty.spawn returned an invalid session id.',
+          { endpointId: target.endpointId },
+        )
         throw createAppError('worker.unavailable', {
           debugMessage: 'Remote pty.spawn returned an invalid session id.',
         })
@@ -289,6 +406,11 @@ export function registerPtyMountHandlers(
 
       const homeSessionId = deps.ptyRuntime.registerRemoteSession({
         endpointId: target.endpointId,
+        remoteSessionId,
+      })
+      logControlSurfaceInfo('pty-spawn-in-mount:remote-spawned', 'Remote terminal session spawned.', {
+        endpointId: target.endpointId,
+        sessionId: homeSessionId,
         remoteSessionId,
       })
 
