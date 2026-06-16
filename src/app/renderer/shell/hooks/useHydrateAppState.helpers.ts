@@ -13,6 +13,15 @@ import { hydrateAgentNode } from '@contexts/agent/presentation/renderer/hydrateA
 import { repairRuntimeNodeFrame } from './runtimeNodeFrameRepair'
 import { logTerminalReviveDiagnostic } from '../../debug/runtimeDiagnostics'
 
+export function logHydrationDiagnostic(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  // eslint-disable-next-line no-console -- runtime restore failures were previously swallowed silently; always surface them in the DevTools console so frozen terminals are diagnosable
+  console[level](`[opencove][hydrate] ${message}`, details ?? '')
+}
+
 export function toShellWorkspaceState(
   workspace: PersistedWorkspaceState,
   options?: { dropRuntimeSessionIds?: boolean },
