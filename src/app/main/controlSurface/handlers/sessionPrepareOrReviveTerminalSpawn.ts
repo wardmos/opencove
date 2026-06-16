@@ -4,6 +4,7 @@ import type { MountDto, SpawnTerminalResult } from '../../../../shared/contracts
 import type { ControlSurface } from '../controlSurface'
 import type { ControlSurfaceContext } from '../types'
 import { invokeCommand } from './sessionPrepareOrReviveShared'
+import { logControlSurfaceInfo } from '../controlSurfaceDiagnostics'
 import {
   DEFAULT_PTY_COLS,
   DEFAULT_PTY_ROWS,
@@ -93,6 +94,19 @@ export async function spawnFallbackTerminal(options: {
     workspace: options.workspace,
     space: options.space,
     cwd: options.cwd,
+  })
+
+  // Diagnose terminal revive that ends in `[process exited with code 1]`: if a
+  // remote terminal loses its mount context here (mountId === null), it falls
+  // back to pty.spawn on whichever worker runs revive (the home worker), using a
+  // remote cwd that does not exist locally, so the shell exits 1 immediately.
+  logControlSurfaceInfo('revive-spawn:context', 'Resolved terminal revive launch context.', {
+    requestedCwd: options.cwd,
+    resolvedWorkingDirectory: launchContext.workingDirectory,
+    mountId: launchContext.mountId,
+    route: launchContext.mountId ? 'pty.spawnInMount' : 'pty.spawn',
+    hasSpace: !!options.space,
+    profileId: options.profileId,
   })
 
   if (launchContext.mountId) {
