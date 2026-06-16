@@ -19,6 +19,7 @@ import {
   toPreparedNodeResult,
 } from './sessionPrepareOrReviveShared'
 import { prepareAgentNode, prepareTerminalNode } from './sessionPrepareOrRevivePreparation'
+import { logControlSurfaceInfo } from '../controlSurfaceDiagnostics'
 
 const PREPARE_OR_REVIVE_CONCURRENCY = 4
 
@@ -68,6 +69,11 @@ export function registerSessionPrepareOrReviveHandler(
     kind: 'command',
     validate: normalizeWorkspaceIdPayload,
     handle: async (ctx, payload): Promise<PrepareOrReviveSessionResult> => {
+      logControlSurfaceInfo('prepare-or-revive:enter', 'session.prepareOrRevive handler entered.', {
+        pid: process.pid,
+        workspaceId: payload.workspaceId,
+        nodeIdCount: Array.isArray(payload.nodeIds) ? payload.nodeIds.length : 0,
+      })
       const store = await deps.getPersistenceStore()
       const normalized = normalizePersistedAppState(await store.readAppState())
       const workspace = normalized?.workspaces.find(item => item.id === payload.workspaceId) ?? null
@@ -95,7 +101,17 @@ export function registerSessionPrepareOrReviveHandler(
         PREPARE_OR_REVIVE_CONCURRENCY,
         async (node): Promise<PreparedRuntimeNodeResult | null> => {
           const existingSessionId = normalizeOptionalString(node.sessionId)
-          if (existingSessionId && deps.ptyStreamHub.hasSession(existingSessionId)) {
+          const hasLiveSession =
+            !!existingSessionId && deps.ptyStreamHub.hasSession(existingSessionId)
+          logControlSurfaceInfo('prepare-or-revive:node', 'Routing node for prepare/revive.', {
+            pid: process.pid,
+            nodeId: node.id,
+            kind: node.kind,
+            existingSessionId: existingSessionId ?? '<empty>',
+            hasLiveSession,
+            route: hasLiveSession ? 'live' : node.kind,
+          })
+          if (hasLiveSession) {
             const scrollback =
               node.kind === 'agent'
                 ? null
