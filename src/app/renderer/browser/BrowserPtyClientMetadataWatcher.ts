@@ -1,5 +1,6 @@
 import type { TerminalSessionMetadataEvent } from '@shared/contracts/dto'
 import { invokeBrowserControlSurface } from './browserControlSurface'
+import { logTerminalReviveDiagnostic } from '../debug/runtimeDiagnostics'
 
 type MetadataWatcherState = {
   timer: number | null
@@ -60,7 +61,17 @@ export class BrowserPtyClientMetadataWatcher {
           id: 'session.get',
           payload: { sessionId: normalizedSessionId },
         })
-      } catch {
+      } catch (error) {
+        logTerminalReviveDiagnostic(
+          'metadata:session-get-failed',
+          'session.get failed during metadata resolve; cancelling watcher.',
+          {
+            sessionId: normalizedSessionId,
+            attempt: watcher.attempt,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
+          'error',
+        )
         this.cancel(normalizedSessionId)
         return
       }

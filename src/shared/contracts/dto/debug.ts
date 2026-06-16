@@ -37,6 +37,7 @@ export type RuntimeDiagnosticsSource =
   | 'renderer-error-boundary'
   | 'renderer-performance-monitor'
   | 'renderer-workspace-canvas'
+  | 'renderer-terminal-revive'
 export type RuntimeDiagnosticsDetailValue = string | number | boolean | null
 
 export interface RuntimeDiagnosticsLogInput {

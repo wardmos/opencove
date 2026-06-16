@@ -19,6 +19,7 @@ import type {
 } from '@shared/contracts/dto'
 import { getBrowserQueryToken, invokeBrowserControlSurface } from './browserControlSurface'
 import { BrowserPtyClientMetadataWatcher } from './BrowserPtyClientMetadataWatcher'
+import { logTerminalReviveDiagnostic } from '../debug/runtimeDiagnostics'
 
 type UnsubscribeFn = () => void
 
@@ -164,6 +165,24 @@ export class BrowserPtyClient {
     const record = payload as Record<string, unknown>
     const type = typeof record.type === 'string' ? record.type : null
     const sessionId = typeof record.sessionId === 'string' ? record.sessionId : null
+
+    // Server error frames (e.g. attach to an unknown session => 'session.not_found')
+    // were previously dropped silently here, leaving restored terminals frozen with
+    // no signal. Surface them so the revive flow can be diagnosed. May arrive without
+    // a sessionId, so handle before the sessionId guard below.
+    if (type === 'error') {
+      logTerminalReviveDiagnostic(
+        'stream:error',
+        'PTY stream server returned an error frame.',
+        {
+          sessionId: sessionId ?? '<none>',
+          code: typeof record.code === 'string' ? record.code : null,
+          message: typeof record.message === 'string' ? record.message : null,
+        },
+        'error',
+      )
+      return
+    }
 
     if (!type || !sessionId) {
       return
@@ -344,6 +363,11 @@ export class BrowserPtyClient {
       state.lastSeq = Math.max(state.lastSeq, afterSeq)
     }
     this.attachedSessions.set(payload.sessionId, state)
+
+    logTerminalReviveDiagnostic('attach:send', 'Sending PTY stream attach.', {
+      sessionId: payload.sessionId,
+      afterSeq: state.lastSeq,
+    })
 
     await this.sendSocketMessage({
       type: 'attach',

@@ -11,6 +11,7 @@ import { toRuntimeNodes } from '@contexts/workspace/presentation/renderer/utils/
 import { mergeScrollbackSnapshots } from '@contexts/workspace/presentation/renderer/components/terminalNode/scrollback'
 import { hydrateAgentNode } from '@contexts/agent/presentation/renderer/hydrateAgentNode'
 import { repairRuntimeNodeFrame } from './runtimeNodeFrameRepair'
+import { logTerminalReviveDiagnostic } from '../../debug/runtimeDiagnostics'
 
 export function toShellWorkspaceState(
   workspace: PersistedWorkspaceState,
@@ -327,6 +328,16 @@ export async function prepareWorkspaceRuntimeNodes({
   const controlSurfaceInvoke = window.opencoveApi?.controlSurface?.invoke
   const shouldRequireWorker = workerOnly ?? typeof controlSurfaceInvoke === 'function'
 
+  logTerminalReviveDiagnostic('prepare:start', 'Preparing/reviving runtime nodes on hydrate.', {
+    workspaceId: workspace.id,
+    shouldRequireWorker,
+    hasControlSurface: typeof controlSurfaceInvoke === 'function',
+    runtimeNodeCount: runtimeNodes.length,
+    nodes: runtimeNodes
+      .map(node => `${node.id}:${node.data.kind}:sid=${(node.data.sessionId ?? '') || '<empty>'}`)
+      .join(','),
+  })
+
   if (typeof controlSurfaceInvoke === 'function') {
     try {
       const prepared = await controlSurfaceInvoke<PrepareOrReviveSessionResult>({
@@ -339,6 +350,22 @@ export async function prepareWorkspaceRuntimeNodes({
       })
 
       for (const preparedNode of prepared.nodes ?? []) {
+        logTerminalReviveDiagnostic(
+          'prepare:node-result',
+          'prepareOrRevive returned a node.',
+          {
+            nodeId: preparedNode.nodeId,
+            kind: preparedNode.kind,
+            recoveryState: preparedNode.recoveryState,
+            sessionId: preparedNode.sessionId || '<empty>',
+            isLiveSessionReattach: preparedNode.isLiveSessionReattach,
+            status: preparedNode.status,
+            exitCode: preparedNode.exitCode,
+            lastError: preparedNode.lastError,
+          },
+          preparedNode.sessionId && !preparedNode.lastError ? 'info' : 'error',
+        )
+
         const currentNode = runtimeNodes.find(node => node.id === preparedNode.nodeId)
         if (!currentNode) {
           continue
@@ -346,7 +373,17 @@ export async function prepareWorkspaceRuntimeNodes({
 
         preparedById.set(currentNode.id, toHydratedRuntimeNode(currentNode, preparedNode))
       }
-    } catch {
+    } catch (error) {
+      logTerminalReviveDiagnostic(
+        'prepare:invoke-failed',
+        'session.prepareOrRevive invocation threw.',
+        {
+          workspaceId: workspace.id,
+          shouldRequireWorker,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        },
+        'error',
+      )
       if (shouldRequireWorker) {
         return []
       }
@@ -356,6 +393,15 @@ export async function prepareWorkspaceRuntimeNodes({
   }
 
   if (shouldRequireWorker) {
+    const dropped = runtimeNodes.filter(node => !preparedById.has(node.id)).map(node => node.id)
+    if (dropped.length > 0) {
+      logTerminalReviveDiagnostic(
+        'prepare:nodes-dropped',
+        'Runtime nodes were dropped from hydration (no prepared result).',
+        { workspaceId: workspace.id, droppedNodeIds: dropped.join(',') },
+        'error',
+      )
+    }
     return runtimeNodes
       .map(node => preparedById.get(node.id) ?? node)
       .filter(node => preparedById.has(node.id))
