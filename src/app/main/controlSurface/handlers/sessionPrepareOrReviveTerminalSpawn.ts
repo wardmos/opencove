@@ -1,5 +1,7 @@
+import { stat } from 'node:fs/promises'
 import { toFileUri } from '../../../../contexts/filesystem/domain/fileUri'
 import { resolveSpaceMountContext } from '../../../../contexts/space/application/resolveSpaceMountContext'
+import { createAppError } from '../../../../shared/errors/appError'
 import type { MountDto, SpawnTerminalResult } from '../../../../shared/contracts/dto'
 import type { ControlSurface } from '../controlSurface'
 import type { ControlSurfaceContext } from '../types'
@@ -78,6 +80,26 @@ export async function resolvePrepareOrReviveLaunchContext(options: {
   }
 }
 
+// On reopen, revive can race ahead of remote endpoint/mount registration, so a
+// remote terminal's mount is briefly absent from mount.list. Wait a bounded
+// while for it to appear before giving up (rather than spawning a doomed local
+// shell). resolveSpaceMountContext matches the mount by cwd, so this also
+// recovers when the persisted targetMountId churned to a new id across reopens.
+const MOUNT_WAIT_ATTEMPTS = 8
+const MOUNT_WAIT_DELAY_MS = 500
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms)
+  })
+}
+
+async function directoryExistsLocally(path: string): Promise<boolean> {
+  return stat(path)
+    .then(entry => entry.isDirectory())
+    .catch(() => false)
+}
+
 export async function spawnFallbackTerminal(options: {
   controlSurface: ControlSurface
   ctx: ControlSurfaceContext
@@ -88,26 +110,53 @@ export async function spawnFallbackTerminal(options: {
   geometry?: PtyGeometry
 }): Promise<SpawnTerminalResult & { cwd: string }> {
   const geometry = options.geometry ?? { cols: DEFAULT_PTY_COLS, rows: DEFAULT_PTY_ROWS }
-  const launchContext = await resolvePrepareOrReviveLaunchContext({
-    controlSurface: options.controlSurface,
-    ctx: options.ctx,
-    workspace: options.workspace,
-    space: options.space,
-    cwd: options.cwd,
-  })
+  const resolveLaunchContext = (): Promise<PrepareOrReviveLaunchContext> =>
+    resolvePrepareOrReviveLaunchContext({
+      controlSurface: options.controlSurface,
+      ctx: options.ctx,
+      workspace: options.workspace,
+      space: options.space,
+      cwd: options.cwd,
+    })
 
-  // Diagnose terminal revive that ends in `[process exited with code 1]`: if a
-  // remote terminal loses its mount context here (mountId === null), it falls
-  // back to pty.spawn on whichever worker runs revive (the home worker), using a
-  // remote cwd that does not exist locally, so the shell exits 1 immediately.
+  let launchContext = await resolveLaunchContext()
+
+  // When the mount is unresolved AND the cwd does not exist on this host, this is
+  // a remote terminal whose mount has not registered yet (or whose persisted
+  // mount id churned across reopen). Spawning a local shell here would chdir into
+  // a non-existent directory and exit 1 immediately. Wait briefly for the mount
+  // to come up so we can route to the remote endpoint instead.
+  const cwdMissingLocally =
+    !launchContext.mountId && !(await directoryExistsLocally(launchContext.workingDirectory))
+  if (cwdMissingLocally) {
+    /* eslint-disable no-await-in-loop -- intentional sequential poll with backoff */
+    for (let attempt = 0; attempt < MOUNT_WAIT_ATTEMPTS && !launchContext.mountId; attempt += 1) {
+      await sleep(MOUNT_WAIT_DELAY_MS)
+      launchContext = await resolveLaunchContext()
+    }
+    /* eslint-enable no-await-in-loop */
+  }
+
   logControlSurfaceInfo('revive-spawn:context', 'Resolved terminal revive launch context.', {
     requestedCwd: options.cwd,
     resolvedWorkingDirectory: launchContext.workingDirectory,
     mountId: launchContext.mountId,
     route: launchContext.mountId ? 'pty.spawnInMount' : 'pty.spawn',
     hasSpace: !!options.space,
+    cwdMissingLocally,
     profileId: options.profileId,
   })
+
+  // Remote terminal whose mount never became available: refuse to spawn a local
+  // shell with a remote cwd (a guaranteed exit-1 dead shell). Throwing lets
+  // prepareTerminalNode return a non-spawned "needs revive" state instead.
+  if (cwdMissingLocally && !launchContext.mountId) {
+    throw createAppError('worker.unavailable', {
+      debugMessage:
+        'revive: remote terminal mount unavailable; not spawning local shell for cwd ' +
+        launchContext.workingDirectory,
+    })
+  }
 
   if (launchContext.mountId) {
     const spawned = await invokeCommand<SpawnTerminalResult>(options.controlSurface, options.ctx, {
