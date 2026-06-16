@@ -362,6 +362,9 @@ export async function prepareWorkspaceRuntimeNodes({
             status: preparedNode.status,
             exitCode: preparedNode.exitCode,
             lastError: preparedNode.lastError,
+            executionDirectory: preparedNode.executionDirectory ?? null,
+            expectedDirectory: preparedNode.expectedDirectory ?? null,
+            runtimeKind: preparedNode.runtimeKind,
           },
           preparedNode.sessionId && !preparedNode.lastError ? 'info' : 'error',
         )
