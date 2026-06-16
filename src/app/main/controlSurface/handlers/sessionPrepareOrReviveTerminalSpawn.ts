@@ -52,26 +52,35 @@ export async function resolvePrepareOrReviveLaunchContext(options: {
   space: NormalizedPersistedSpace | null
   cwd: string
 }): Promise<PrepareOrReviveLaunchContext> {
-  if (!options.space) {
-    return {
-      mountId: null,
-      workingDirectory: options.cwd,
-    }
-  }
-
   const mounts = await listWorkspaceMounts({
     controlSurface: options.controlSurface,
     ctx: options.ctx,
     workspaceId: options.workspace.id,
   })
+  // Infer the mount from the terminal's cwd even when it has no owning space (or
+  // its persisted targetMountId churned across reopen): resolveSpaceMountContext
+  // matches a mount whose rootPath contains the cwd. Without this, a remote
+  // terminal with no space fell through to a local pty.spawn with a remote cwd.
   const resolved = resolveSpaceMountContext({
     space: {
       directoryPath: options.cwd,
-      targetMountId: options.space.targetMountId,
-      boundary: options.space.boundary,
+      targetMountId: options.space?.targetMountId ?? null,
+      boundary: options.space?.boundary ?? null,
     },
     workspacePath: options.workspace.path,
     mounts,
+  })
+
+  logControlSurfaceInfo('revive-mount:resolve', 'Resolved mount for terminal revive.', {
+    cwd: options.cwd,
+    hasSpace: !!options.space,
+    targetMountId: options.space?.targetMountId ?? null,
+    mountCount: mounts.length,
+    resolvedMountId: resolved.mount?.mountId ?? null,
+    mountRoots: mounts
+      .map(mount => mount.rootPath)
+      .join(',')
+      .slice(0, 300),
   })
 
   return {
